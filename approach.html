@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Marker Detection Approach - Sanidhya Sishodia</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: Georgia, 'Times New Roman', serif;
+      font-size: 15px;
+      line-height: 1.75;
+      color: #1a1a1a;
+      background: #fff;
+      max-width: 760px;
+      margin: 60px auto;
+      padding: 0 40px 80px;
+    }
+    h1 {
+      font-size: 26px;
+      font-weight: bold;
+      margin-bottom: 4px;
+      color: #111;
+    }
+    .meta {
+      font-size: 13px;
+      color: #666;
+      margin-bottom: 40px;
+      font-family: Arial, sans-serif;
+    }
+    h2 {
+      font-size: 17px;
+      font-weight: bold;
+      margin: 36px 0 10px;
+      color: #111;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid #ddd;
+      padding-bottom: 6px;
+    }
+    p { margin-bottom: 14px; }
+    ul { margin: 10px 0 14px 22px; }
+    li { margin-bottom: 8px; }
+    code {
+      background: #f4f4f4;
+      border: 1px solid #ddd;
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+    }
+    .pipeline {
+      background: #f9f9f9;
+      border-left: 3px solid #333;
+      padding: 14px 18px;
+      margin: 14px 0;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      line-height: 2;
+    }
+    .pipeline span {
+      color: #555;
+      font-style: italic;
+      font-family: Georgia, serif;
+      font-size: 13px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0;
+      font-size: 14px;
+      font-family: Arial, sans-serif;
+    }
+    th {
+      background: #f0f0f0;
+      text-align: left;
+      padding: 8px 12px;
+      border: 1px solid #ccc;
+      font-size: 13px;
+    }
+    td {
+      padding: 8px 12px;
+      border: 1px solid #ddd;
+      vertical-align: top;
+    }
+    @media print {
+      body { margin: 0; padding: 40px; }
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Marker Detection - Approach Document</h1>
+  <div class="meta">Alemeno Frontend Internship Assignment &nbsp;|&nbsp; Sanidhya Sishodia &nbsp;|&nbsp; April 2026</div>
+
+  <h2>What I Built</h2>
+  <p>
+    A React Native Android app that uses the phone camera to scan a custom visual marker, extract it, correct its orientation, and display 20 captured frames in a results grid. The detection and image processing runs fully in native Kotlin using OpenCV so it is fast and doesn't block the UI.
+  </p>
+  <p>
+    I used Marker 1 from the provided set - a 140x140mm square with a thick solid black border and a 20x20mm solid black orientation square placed at one inner corner.
+  </p>
+
+  <h2>Why This Marker</h2>
+  <p>
+    Marker 1 is simple, unambiguous, and fast to detect. The thick black border gives a very strong contour signal even in imperfect lighting. The single corner dot is a reliable orientation cue - its position (top-left, top-right, bottom-right, or bottom-left) tells you exactly how to rotate the extracted image back to canonical form. There is no ambiguity in any of the four rotations.
+  </p>
+
+  <h2>Detection Pipeline</h2>
+  <p>Every camera frame goes through this sequence in a background thread:</p>
+  <div class="pipeline">
+    Photo JPEG<br>
+    &rarr; Bitmap &rarr; RGBA Mat &rarr; Grayscale<br>
+    &rarr; Downsample to max 1500px <span>(speed - full res not needed for finding a quad)</span><br>
+    &rarr; Gaussian blur 5x5 <span>(smooth out noise before thresholding)</span><br>
+    &rarr; Adaptive threshold, inverted <span>(dark border regions become white)</span><br>
+    &rarr; Morphological close 3x3 <span>(bridge small gaps in the border contour)</span><br>
+    &rarr; findContours, outermost only<br>
+    &rarr; For each contour:<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;area filter (0.5% - 70% of frame)<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;approxPolyDP &rarr; must give exactly 4 vertices<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;convexity check<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;aspect ratio 0.6 - 1.7 (roughly square)<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;perspectiveWarp to 300x300<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&rarr; verifyMarker1Structure<br>
+    &rarr; If valid: extract from full-res gray, correctOrientation, encode JPEG base64
+  </div>
+
+  <h2>Why Adaptive Thresholding</h2>
+  <p>
+    A global threshold (like Otsu) picks one brightness cutoff for the whole image. If one side of the marker is in shadow and the other is brightly lit, a single threshold will either blow out the bright side or miss the dark side entirely.
+  </p>
+  <p>
+    Adaptive thresholding computes a local threshold for each pixel based on its neighborhood. The marker border is dark relative to whatever surrounds it, and that local contrast is preserved regardless of overall lighting. This is the single biggest robustness improvement over a naive approach.
+  </p>
+
+  <h2>Marker Verification</h2>
+  <p>
+    Finding a quad-shaped contour is not enough - phones see lots of rectangular things (books, screens, windows, tiles). The <code>verifyMarker1Structure</code> function warps the candidate to 300x300 and applies two checks:
+  </p>
+  <ul>
+    <li>
+      <strong>Border check:</strong> All four edge strips of the warped image must have a low average brightness (mean below 140). This confirms the thick black border is present on all sides.
+    </li>
+    <li>
+      <strong>Orientation dot check:</strong> The four inner corner regions are sampled. The darkest corner is identified. It must have a mean below 110 AND must be at least 30 brightness units darker than the next-darkest corner. A solid black square is distinctly darker than any image content - this gap reliably separates the real dot from ordinary dark image content in other corners.
+    </li>
+  </ul>
+  <p>
+    Using a relative comparison (dot vs. second-darkest) rather than absolute cutoffs makes the check robust to varying screen brightness, camera exposure, and any image printed or displayed inside the marker.
+  </p>
+
+  <h2>Orientation Correction</h2>
+  <p>
+    Once the dot corner is identified, the rotation needed to bring it to the top-left is straightforward:
+  </p>
+  <table>
+    <tr><th>Dot position</th><th>Rotation applied</th></tr>
+    <tr><td>Top-left</td><td>No rotation</td></tr>
+    <tr><td>Top-right</td><td>90 degrees counter-clockwise</td></tr>
+    <tr><td>Bottom-right</td><td>180 degrees</td></tr>
+    <tr><td>Bottom-left</td><td>90 degrees clockwise</td></tr>
+  </table>
+  <p>
+    The rotation is applied after extracting the marker from the full-resolution grayscale image (not the downsampled version), so the final 300x300 output is sharp.
+  </p>
+
+  <h2>Performance</h2>
+  <p>
+    Detection runs on the downsampled image (capped at 1500px on the longest side) so the contour-finding and thresholding steps are fast. Once a valid marker is found, the perspective warp for extraction is done on the full-resolution grayscale, giving a clean 300x300 crop. Frames are captured every 250ms with a busy-flag preventing concurrent processing, so there is no queue buildup.
+  </p>
+
+  <h2>Tech Stack</h2>
+  <table>
+    <tr><th>Layer</th><th>Technology</th></tr>
+    <tr><td>Framework</td><td>React Native 0.85</td></tr>
+    <tr><td>Camera</td><td>react-native-vision-camera v5</td></tr>
+    <tr><td>Computer Vision</td><td>OpenCV 4.9.0 (Maven Central)</td></tr>
+    <tr><td>Native module</td><td>Kotlin (ReactContextBaseJavaModule)</td></tr>
+    <tr><td>Navigation</td><td>@react-navigation/native-stack</td></tr>
+  </table>
+
+  <h2>What I Would Improve With More Time</h2>
+  <p>
+    The current pipeline re-runs the full contour search on every frame. A natural improvement would be to track the marker across frames once detected - using the previous frame's corner positions as a tight region of interest - to reduce per-frame work. I would also add a visual overlay on the live camera feed showing the detected quad in real time so the user gets immediate feedback.
+  </p>
+
+</body>
+</html>
