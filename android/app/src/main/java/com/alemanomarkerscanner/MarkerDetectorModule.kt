@@ -10,7 +10,6 @@ import com.facebook.react.bridge.ReactMethod
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
-import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint
 import org.opencv.core.MatOfPoint2f
@@ -19,7 +18,6 @@ import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.io.ByteArrayOutputStream
 import kotlin.math.max
-import kotlin.math.min
 
 class MarkerDetectorModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -184,9 +182,11 @@ class MarkerDetectorModule(reactContext: ReactApplicationContext) :
     // ---------------------------------------------------------------
     // Verifies that a 300x300 warped grayscale image matches Marker 1:
     //   - Thick solid black border on all 4 sides
-    //   - Mostly white interior
-    //   - Exactly ONE small black square (~14% of size) at a corner
-    //   - Black area does NOT extend beyond the expected dot zone
+    //   - Exactly ONE inner corner region that is clearly and distinctly
+    //     darker than the other three (the orientation dot)
+    //
+    // Uses relative comparison so it works regardless of interior image
+    // content (animal faces, colored images, etc.) and screen brightness.
     //
     // Returns dot corner index (0=TL, 1=TR, 2=BR, 3=BL) or -1 if invalid.
     // ---------------------------------------------------------------
@@ -194,18 +194,18 @@ class MarkerDetectorModule(reactContext: ReactApplicationContext) :
         val S = 300
 
         // Marker 1 proportions (original 140x140):
-        //   Border width ~13% of total -> 39px in 300px space
+        //   Border width ~13% of total -> 38px in 300px space
         //   Corner dot: 20/140 * 300 = 43px
         val borderW = 38
         val dotSz = 43
-        val beyondSz = 22   // pixels just outside the expected dot zone
 
         val innerStart = borderW
         val dotEnd = borderW + dotSz
         val farStart = S - borderW - dotSz
         val innerEnd = S - borderW
 
-        // --- 1. All 4 border strips must be dark (mean < 110) ---
+        // 1. All 4 border strips must be dark.
+        // Threshold 140 tolerates screen black (typically 20-80 gray through camera).
         val topStrip = w.submat(0, borderW, 0, S)
         val botStrip = w.submat(S - borderW, S, 0, S)
         val lefStrip = w.submat(borderW, S - borderW, 0, borderW)
@@ -216,19 +216,11 @@ class MarkerDetectorModule(reactContext: ReactApplicationContext) :
         val lm = Core.mean(lefStrip).`val`[0]; lefStrip.release()
         val rm = Core.mean(rigStrip).`val`[0]; rigStrip.release()
 
-        if (tm > 110 || bm > 110 || lm > 110 || rm > 110) return -1
+        if (tm > 140 || bm > 140 || lm > 140 || rm > 140) return -1
 
-        // --- 2. Center of interior must be mostly white (mean > 150) ---
-        val cx0 = dotEnd + 8
-        val cx1 = farStart - 8
-        if (cx1 > cx0) {
-            val center = w.submat(cx0, cx1, cx0, cx1)
-            val cm = Core.mean(center).`val`[0]; center.release()
-            if (cm < 150) return -1
-        }
-
-        // --- 3. Check the 4 inner corner sub-regions for the dot ---
-        // Exactly ONE must be dark (<90), the other THREE must be light (>155)
+        // 2. Find the orientation dot via relative corner darkness.
+        // The dot is a solid black 43x43px square - it will always be the
+        // darkest of the four inner corners AND clearly darker than the rest.
         val tlReg = w.submat(innerStart, dotEnd, innerStart, dotEnd)
         val trReg = w.submat(innerStart, dotEnd, farStart, innerEnd)
         val brReg = w.submat(farStart, innerEnd, farStart, innerEnd)
@@ -241,57 +233,17 @@ class MarkerDetectorModule(reactContext: ReactApplicationContext) :
             Core.mean(blReg).`val`[0].also { blReg.release() }
         )
 
-        val darkList = means.indices.filter { means[it] < 90 }
-        val lightList = means.indices.filter { means[it] > 155 }
+        val dotIdx = means.indices.minByOrNull { means[it] }!!
+        val dotMean = means[dotIdx]
+        val secondDarkest = means.indices.filter { it != dotIdx }.minOf { means[it] }
 
-        if (darkList.size != 1 || lightList.size != 3) return -1
-
-        val dotIdx = darkList[0]
-
-        // --- 4. Size guard: pixels JUST BEYOND the dot zone must be bright ---
-        // Rejects incorrect images where the black fill is larger than the real dot.
-        val beyondBright = checkBeyondDot(w, dotIdx, innerStart, dotEnd, farStart, innerEnd, beyondSz)
-        if (!beyondBright) return -1
+        // Dot must be absolutely dark (solid black square) and clearly darker
+        // than the next-darkest corner. The 30-unit gap distinguishes a real
+        // solid dot from uniformly dark interior image content.
+        if (dotMean > 110) return -1
+        if (secondDarkest - dotMean < 30) return -1
 
         return dotIdx
-    }
-
-    // Checks that the area just outside the expected dot region (in x and y
-    // directions) is mostly white. Returns false if that zone is dark.
-    private fun checkBeyondDot(
-        w: Mat, dotIdx: Int,
-        innerStart: Int, dotEnd: Int, farStart: Int, innerEnd: Int,
-        beyondSz: Int
-    ): Boolean {
-        val threshold = 145.0
-
-        fun mean(r0: Int, r1: Int, c0: Int, c1: Int): Double {
-            if (r1 <= r0 || c1 <= c0) return 255.0
-            val sub = w.submat(r0, r1, c0, c1)
-            val m = Core.mean(sub).`val`[0]
-            sub.release()
-            return m
-        }
-
-        return when (dotIdx) {
-            0 -> { // TL dot - beyond is to the RIGHT and BELOW the dot
-                mean(innerStart, dotEnd, dotEnd, min(dotEnd + beyondSz, farStart)) > threshold &&
-                mean(dotEnd, min(dotEnd + beyondSz, farStart), innerStart, dotEnd) > threshold
-            }
-            1 -> { // TR dot - beyond is to the LEFT and BELOW
-                mean(innerStart, dotEnd, max(farStart - beyondSz, dotEnd), farStart) > threshold &&
-                mean(dotEnd, min(dotEnd + beyondSz, farStart), farStart, innerEnd) > threshold
-            }
-            2 -> { // BR dot - beyond is to the LEFT and ABOVE
-                mean(farStart, innerEnd, max(farStart - beyondSz, dotEnd), farStart) > threshold &&
-                mean(max(farStart - beyondSz, dotEnd), farStart, farStart, innerEnd) > threshold
-            }
-            3 -> { // BL dot - beyond is to the RIGHT and ABOVE
-                mean(farStart, innerEnd, dotEnd, min(dotEnd + beyondSz, farStart)) > threshold &&
-                mean(max(farStart - beyondSz, dotEnd), farStart, innerStart, dotEnd) > threshold
-            }
-            else -> false
-        }
     }
 
     // ---------------------------------------------------------------
